@@ -1,0 +1,93 @@
+# Docker Compose for Night Sky Simulator
+# Provides multiple configurations for different platforms
+
+services:
+  # Main service for Linux with X11
+  sky-simulator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sky-simulator:latest
+    container_name: sky-simulator
+    
+    environment:
+      - DISPLAY=${DISPLAY:-:0}
+    
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    
+    network_mode: host
+    stdin_open: true
+    tty: true
+
+  # Service for Windows with VcXsrv
+  sky-simulator-windows:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sky-simulator:latest
+    container_name: sky-simulator-win
+    
+    environment:
+      - DISPLAY=host.docker.internal:0
+    
+    stdin_open: true
+    tty: true
+    
+    profiles:
+      - windows
+
+  # Service for WSL2 with Wayland (WSLg)
+  sky-simulator-wsl2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sky-simulator:latest
+    container_name: sky-simulator-wsl2
+    
+    environment:
+      - DISPLAY=${DISPLAY:-:0}
+      - WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0}
+      - XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir
+      - GDK_BACKEND=x11
+    
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - /mnt/wslg:/mnt/wslg:rw
+    
+    network_mode: host
+    stdin_open: true
+    tty: true
+    
+    profiles:
+      - wsl2
+
+  # Development service with source code mounted for quick iteration
+  sky-simulator-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sky-simulator:latest
+    container_name: sky-simulator-dev
+    
+    environment:
+      - DISPLAY=${DISPLAY:-:0}
+      - WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0}
+      - XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir
+      - GDK_BACKEND=x11
+      - SKY_DEBUG=1
+    
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - /mnt/wslg:/mnt/wslg:rw
+      # Mount source for development (no rebuild needed)
+      - ./sky_simulator:/app/sky_simulator:ro
+      - ./data:/app/data:ro
+      - ./run_sky_simulator.py:/app/run_sky_simulator.py:ro
+    
+    network_mode: host
+    stdin_open: true
+    tty: true
+    
+    profiles:
+      - dev

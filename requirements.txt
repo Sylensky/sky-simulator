@@ -1,0 +1,8 @@
+# Requirements for Night Sky Simulator
+# Note: tkinter is usually included with Python, no pip install needed
+
+# Image processing
+Pillow>=9.0.0
+
+# Numerical operations for coordinates and rendering
+numpy>=1.21.0
