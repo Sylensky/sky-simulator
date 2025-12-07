@@ -86,6 +86,9 @@ class SkyCanvas:
         self._drag_start_pa: float = 0.0  # Parallactic angle at drag start
         self._is_dragging: bool = False
         
+        # Rotation state for sky rotation mode
+        self._rotation_angle = 0.0  # degrees, cumulative rotation around pole
+        
         # Image loader
         self._image_loader: Optional[ImageLoader] = None
         self._use_images: bool = True  # Can be toggled
@@ -113,6 +116,9 @@ class SkyCanvas:
         # Alt-Az simulation mode - when enabled, shows sky as seen from observer location
         # with Polaris at altitude = observer latitude
         self._altaz_mode = True  # Enable realistic horizon-based view
+        
+        # Polar mode - when enabled in RA-DEC, flips Y axis so pole is at top
+        self._polar_mode = False
         
         # Object info overlay (bottom-right corner)
         self._hovered_object: Optional[CelestialObject] = None
@@ -170,6 +176,39 @@ class SkyCanvas:
         self.center_dec = CoordinateUtils.clamp_dec(dec_deg)
         # Recalculate parallactic angle for new view center
         self._update_parallactic_angle()
+    
+    def add_rotation_angle(self, delta_degrees: float):
+        """Add to the cumulative rotation angle for sky rotation mode"""
+        self._rotation_angle += delta_degrees
+        self._rotation_angle = self._rotation_angle % 360  # Keep in 0-360 range
+    
+    def reset_rotation_angle(self):
+        """Reset the rotation angle to zero"""
+        self._rotation_angle = 0.0
+    
+    def get_rotation_angle(self) -> float:
+        """Get current rotation angle in degrees"""
+        return self._rotation_angle
+    
+    def set_altaz_mode(self, enabled: bool):
+        """
+        Set Alt-Az mode.
+        When True: Display in Alt-Az coordinates (horizon-based view)
+        When False: Display in RA/DEC coordinates (equatorial view)
+        """
+        self._altaz_mode = enabled
+    
+    def set_polar_mode(self, enabled: bool):
+        """
+        Set Polar mode for RA-DEC projection.
+        When True: Y-axis points toward celestial pole, X-axis flipped for realistic view
+        When False: Standard equatorial projection
+        """
+        self._polar_mode = enabled
+    
+    def is_dragging(self) -> bool:
+        """Check if user is currently dragging the view"""
+        return self._is_dragging
     
     def set_optics(self, focal_length: float, sensor_width: float, sensor_height: float):
         """Update optical parameters"""
@@ -290,7 +329,7 @@ class SkyCanvas:
                 # (as it appears when looking at the real sky facing south)
                 x_proj = -x_proj
         else:
-            # Pure equatorial mode (original behavior)
+            # Pure equatorial mode
             center_ra_rad = math.radians(self.center_ra * 15.0)
             center_dec_rad = math.radians(self.center_dec)
             
@@ -309,8 +348,48 @@ class SkyCanvas:
                 x_proj = k * math.cos(dec_rad) * math.sin(ra_rad - center_ra_rad)
                 y_proj = k * (math.cos(center_dec_rad) * math.sin(dec_rad) - 
                              math.sin(center_dec_rad) * math.cos(dec_rad) * math.cos(ra_rad - center_ra_rad))
+            
+            # Apply field rotation around celestial pole if rotation angle is set
+            # The rotation happens around where the North Celestial Pole (DEC +90°) 
+            # would project to on the screen
+            if abs(self._rotation_angle) > 0.001:
+                # Calculate pole position in projection coordinates
+                # At DEC = 90°, sin(dec) = 1, cos(dec) = 0
+                # The pole projects to (x=0, y=k*(cos(center_dec)*1 - sin(center_dec)*0))
+                #                     = (0, k*cos(center_dec))
+                # where k depends on angular distance from view center to pole
+                
+                # Angular distance from view center to pole
+                # cos(c) = sin(center_dec) * sin(90°) + cos(center_dec) * cos(90°) * cos(dRA)
+                #        = sin(center_dec) * 1 + cos(center_dec) * 0
+                #        = sin(center_dec)
+                cos_c_pole = math.sin(center_dec_rad)
+                
+                # Calculate pole projection position
+                if cos_c_pole > -0.99:  # Pole not directly behind us
+                    k_pole = 1.0 / (1.0 + cos_c_pole) if cos_c_pole > -0.99 else 10.0
+                    pole_x = 0  # Pole is on the DEC axis (no RA offset at pole)
+                    pole_y = k_pole * math.cos(center_dec_rad)  # Above center if looking north of equator
+                    
+                    # Rotate projection coordinates around pole position
+                    theta = math.radians(self._rotation_angle)
+                    cos_theta = math.cos(theta)
+                    sin_theta = math.sin(theta)
+                    
+                    # Translate to pole-centered coordinates
+                    dx = x_proj - pole_x
+                    dy = y_proj - pole_y
+                    
+                    # Rotate
+                    x_rot = dx * cos_theta - dy * sin_theta
+                    y_rot = dx * sin_theta + dy * cos_theta
+                    
+                    # Translate back
+                    x_proj = x_rot + pole_x
+                    y_proj = y_rot + pole_y
         
         # Apply field rotation (parallactic angle) if enabled
+        # Note: sky rotation is now applied in RA/DEC space above, not here
         if self._apply_field_rotation and abs(self._parallactic_angle) > 0.001:
             pa = -self._parallactic_angle
             x_rot = x_proj * math.cos(pa) - y_proj * math.sin(pa)

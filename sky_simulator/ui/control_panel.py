@@ -272,6 +272,23 @@ class ControlPanel:
                        variable=self.rotation_enabled_var,
                        command=self._on_rotation_toggle).pack(anchor=tk.W, padx=5, pady=(5, 0))
         
+        # Tracking mode
+        mode_frame = ttk.Frame(rotation_frame)
+        mode_frame.pack(fill=tk.X, padx=5, pady=(5, 0))
+        ttk.Label(mode_frame, text="Mode:").pack(side=tk.LEFT)
+        self.tracking_mode_var = tk.StringVar(value="Field Rotation")
+        mode_combo = ttk.Combobox(mode_frame, textvariable=self.tracking_mode_var,
+                                 values=["Field Rotation", "Equatorial (Tracked)", "RA Drift"],
+                                 width=24, state="readonly")
+        mode_combo.pack(side=tk.LEFT, padx=5)
+        mode_combo.bind('<<ComboboxSelected>>', lambda e: self._on_tracking_mode_change())
+        
+        # Reverse direction
+        self.rotation_reverse_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(rotation_frame, text="Reverse Direction",
+                       variable=self.rotation_reverse_var,
+                       command=self._on_rotation_reverse_change).pack(anchor=tk.W, padx=5, pady=(2, 0))
+        
         # Speed multiplier
         speed_frame = ttk.Frame(rotation_frame)
         speed_frame.pack(fill=tk.X, padx=5, pady=2)
@@ -318,6 +335,28 @@ class ControlPanel:
         ttk.Button(target_btns, text="Set Target", command=self._on_set_target).pack(side=tk.LEFT, padx=2)
         ttk.Button(target_btns, text="Clear Target", command=self._on_clear_target).pack(side=tk.LEFT, padx=2)
         ttk.Button(target_btns, text="Use Center", command=self._on_use_center_as_target).pack(side=tk.LEFT, padx=2)
+        
+        # Separator before polar alignment section
+        ttk.Separator(test_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=5, pady=5)
+        
+        # Polar Alignment section
+        ttk.Label(test_frame, text="Polar Alignment:", font=('Arial', 9, 'bold')).pack(anchor=tk.W, padx=5, pady=(0, 2))
+        
+        # Camera angle input
+        camera_angle_frame = ttk.Frame(test_frame)
+        camera_angle_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(camera_angle_frame, text="Camera Angle:").pack(side=tk.LEFT)
+        self.camera_angle_var = tk.DoubleVar(value=63.0)
+        camera_angle_spin = ttk.Spinbox(camera_angle_frame, from_=0, to=90, increment=1,
+                                       textvariable=self.camera_angle_var, width=8)
+        camera_angle_spin.pack(side=tk.LEFT, padx=2)
+        ttk.Label(camera_angle_frame, text="° from pole").pack(side=tk.LEFT, padx=2)
+        
+        # Quick navigation
+        nav_btns = ttk.Frame(test_frame)
+        nav_btns.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Button(nav_btns, text="Go to Pole", command=self._on_goto_pole, width=12).pack(side=tk.LEFT, padx=2)
+        ttk.Button(nav_btns, text="Pole in Corner", command=self._on_pole_in_corner, width=12).pack(side=tk.LEFT, padx=2)
         
         # Reticle style
         ttk.Separator(test_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=5, pady=5)
@@ -632,15 +671,41 @@ class ControlPanel:
             speed = self.get_rotation_speed()
             self.on_rotation_speed_change(speed)
     
+    def _on_rotation_reverse_change(self):
+        """Handle rotation direction change"""
+        if self.on_rotation_speed_change:
+            speed = self.get_rotation_speed()
+            self.on_rotation_speed_change(speed)
+    
+    def _on_tracking_mode_change(self):
+        """Handle tracking mode change"""
+        if self.on_rotation_speed_change:
+            speed = self.get_rotation_speed()
+            self.on_rotation_speed_change(speed)
+    
     def get_rotation_enabled(self) -> bool:
         """Get whether rotation simulation is enabled"""
         return self.rotation_enabled_var.get()
     
+    def get_tracking_mode(self) -> str:
+        """Get tracking mode: 'field_rotation', 'equatorial', or 'ra_drift'"""
+        mode = self.tracking_mode_var.get()
+        if "Field Rotation" in mode:
+            return "field_rotation"
+        elif "Equatorial" in mode:
+            return "equatorial"
+        elif "RA Drift" in mode:
+            return "ra_drift"
+        return "field_rotation"
+    
     def get_rotation_speed(self) -> float:
-        """Get rotation speed multiplier"""
+        """Get rotation speed multiplier (negative if reversed)"""
         speed_str = self.rotation_speed_var.get().replace('x', '')
         try:
-            return float(speed_str)
+            speed = float(speed_str)
+            if self.rotation_reverse_var.get():
+                speed = -speed
+            return speed
         except ValueError:
             return 1.0
     
@@ -665,6 +730,13 @@ class ControlPanel:
             return lat, lon
         except ValueError:
             return 51.5, 0.0  # Default to Greenwich
+    
+    def get_camera_angle(self) -> float:
+        """Get camera angle from polar axis in degrees"""
+        try:
+            return float(self.camera_angle_var.get())
+        except (ValueError, AttributeError):
+            return 63.0  # Default camera angle
 
     # Testing section handlers
     def _on_set_target(self):
@@ -684,6 +756,50 @@ class ControlPanel:
         """Handle use center as target button click"""
         if self.on_use_center_as_target:
             self.on_use_center_as_target()
+    
+    def _on_goto_pole(self):
+        """Navigate to celestial pole (Polaris for Northern hemisphere)"""
+        # Get current latitude to determine which pole
+        lat = self.get_location()[0]
+        
+        if lat >= 0:
+            # Northern hemisphere - go to North Celestial Pole (near Polaris)
+            # Polaris: RA ≈ 2h 31m 49s, DEC ≈ +89° 15' 51"
+            ra = 2.5297  # hours
+            dec = 89.264  # degrees
+        else:
+            # Southern hemisphere - go to South Celestial Pole
+            # Sigma Octantis area: RA ≈ 21h, DEC ≈ -89°
+            ra = 21.0  # hours
+            dec = -89.0  # degrees
+        
+        # Navigate to pole
+        if self.on_goto_coords:
+            self.on_goto_coords(ra, dec)
+    
+    def _on_pole_in_corner(self):
+        """Position view based on camera angle from polar axis"""
+        # Get current latitude to determine positioning
+        lat = self.get_location()[0]
+        
+        # Get camera angle from user input
+        # This means view center DEC = 90° - camera_angle
+        # Looking at same RA as Polaris puts pole "above" the center
+        camera_angle = self.camera_angle_var.get()
+        
+        if lat >= 0:
+            # Northern hemisphere
+            # Polaris RA ≈ 2.5h, so look at same RA
+            ra = 2.5  # hours
+            dec = 90.0 - camera_angle
+        else:
+            # Southern hemisphere - position view so SCP is visible
+            ra = 21.0  # hours (opposite side of sky)
+            dec = -(90.0 - camera_angle)
+        
+        # Navigate to position
+        if self.on_goto_coords:
+            self.on_goto_coords(ra, dec)
     
     def _on_testing_change(self):
         """Handle testing settings change"""
@@ -708,3 +824,66 @@ class ControlPanel:
         """Set target coordinates display"""
         self.target_ra_var.set(CoordinateUtils.format_ra(ra))
         self.target_dec_var.set(CoordinateUtils.format_dec(dec))
+    
+    # Settings import/export support
+    def set_optics(self, focal: float, sensor_w: float, sensor_h: float):
+        """Set optics parameters"""
+        self.focal_var.set(str(focal))
+        self.sensor_w_var.set(str(sensor_w))
+        self.sensor_h_var.set(str(sensor_h))
+    
+    def set_display_options(self, options: Dict[str, Any]):
+        """Set display options from dict"""
+        if 'mag_limit' in options:
+            self.mag_var.set(str(options['mag_limit']))
+        if 'show_labels' in options:
+            self.show_labels_var.set(options['show_labels'])
+        if 'show_stars' in options:
+            self.show_stars_var.set(options['show_stars'])
+        if 'show_dso' in options:
+            self.show_dso_var.set(options['show_dso'])
+        if 'show_grid' in options:
+            self.show_grid_var.set(options['show_grid'])
+        if 'show_spikes' in options:
+            self.show_spikes_var.set(options['show_spikes'])
+        if 'spike_count' in options:
+            self.spike_count_var.set(str(options['spike_count']))
+        if 'spike_angle' in options:
+            self.spike_angle_var.set(str(options['spike_angle']))
+    
+    def set_location(self, lat: float, lon: float):
+        """Set observer location"""
+        self.latitude_var.set(str(lat))
+        self.longitude_var.set(str(lon))
+    
+    def set_rotation_enabled(self, enabled: bool):
+        """Set rotation enabled state"""
+        self.rotation_enabled_var.set(enabled)
+    
+    def set_rotation_speed(self, speed: float):
+        """Set rotation speed"""
+        self.rotation_speed_var.set(speed)
+    
+    def set_tracking_mode(self, mode: str):
+        """Set tracking mode"""
+        mode_map = {
+            'radec_polar': "RA-DEC Polar",
+            'rotation': "Sky Rotation (Untracked)",
+            'equatorial': "Equatorial (Tracked)",
+            'untracked': "Fixed Alt-Az"
+        }
+        if mode in mode_map:
+            self.tracking_mode_var.set(mode_map[mode])
+    
+    def set_testing_options(self, options: Dict[str, Any]):
+        """Set testing options from dict"""
+        if 'show_reticle' in options:
+            self.show_reticle_var.set(options['show_reticle'])
+        if 'reticle_style' in options:
+            self.reticle_style_var.set(options['reticle_style'])
+        if 'show_fov_rect' in options:
+            self.show_fov_rect_var.set(options['show_fov_rect'])
+        if 'show_cursor_coords' in options:
+            self.show_cursor_coords_var.set(options['show_cursor_coords'])
+        if 'brightness' in options:
+            self.brightness_var.set(options['brightness'])

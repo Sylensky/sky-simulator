@@ -5,16 +5,21 @@ Coordinates all UI components and application logic.
 
 import math
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from pathlib import Path
 from typing import List, Tuple, Optional
 from datetime import datetime, timedelta
 import os
 import sys
 import importlib
+import json
 
 from ..catalogs.catalog_loader import CatalogManager
 from ..models.celestial_objects import CelestialObject
+from ..models.tracking_modes import (
+    TrackingModeManager, TrackingState, TrackingUpdate,
+    create_tracking_manager
+)
 from ..utils.coordinates import CoordinateUtils
 from .sky_canvas import SkyCanvas
 from .control_panel import ControlPanel
@@ -52,14 +57,17 @@ class MainWindow:
         self.measuring_mode = False
         self.selected_object: Optional[CelestialObject] = None
         
+        # Tracking mode manager (camera at 63° from polar axis)
+        self._tracking_manager = create_tracking_manager(camera_angle=63.0)
+        
         # Earth rotation state
         self._rotation_enabled = False
         self._rotation_speed = 1.0  # Multiplier
         self._rotation_timer_id = None
         
-        # Observer location (default: Greenwich)
-        self._observer_lat = 51.5
-        self._observer_lon = 0.0
+        # Observer location (default: Lat 47°N, Lon 9°E)
+        self._observer_lat = 47.0
+        self._observer_lon = 9.0
         
         # Simulation time (starts at current UTC time)
         self._sim_time = datetime.utcnow()
@@ -116,6 +124,23 @@ class MainWindow:
     
     def _build_ui(self):
         """Build the main UI"""
+        # Menu bar
+        menubar = tk.Menu(self.root)
+        self.root.config(menu=menubar)
+        
+        # Settings menu
+        settings_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Settings", menu=settings_menu)
+        settings_menu.add_command(label="Export Settings...", command=self._export_settings)
+        settings_menu.add_command(label="Import Settings...", command=self._import_settings)
+        
+        # Help menu
+        help_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Help", menu=help_menu)
+        help_menu.add_command(label="Mount Testing Setup Guide", command=self._show_setup_guide)
+        help_menu.add_separator()
+        help_menu.add_command(label="About", command=self._show_about)
+        
         # Main container
         main_frame = ttk.Frame(self.root)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -253,7 +278,16 @@ class MainWindow:
         obj = self.catalog_manager.find_object(target_name)
         
         if obj:
-            self.sky_canvas.set_center(obj.ra_hours, obj.dec_degrees)
+            # Use tracking mode's goto handler
+            state = self._create_tracking_state()
+            new_ra, new_dec, reset_rotation = self._tracking_manager.current_mode.on_goto(
+                obj.ra_hours, obj.dec_degrees, state
+            )
+            
+            if reset_rotation:
+                self.sky_canvas.reset_rotation_angle()
+            
+            self.sky_canvas.set_center(new_ra, new_dec)
             self.control_panel.set_coords(obj.ra_hours, obj.dec_degrees)
             self._update_view()
             self.control_panel.show_object_info(obj)
@@ -271,8 +305,31 @@ class MainWindow:
             messagebox.showerror("Invalid DEC", "DEC must be between -90 and +90 degrees")
             return
         
-        self.sky_canvas.set_center(ra, dec)
+        # Use tracking mode's goto handler
+        state = self._create_tracking_state()
+        new_ra, new_dec, reset_rotation = self._tracking_manager.current_mode.on_goto(
+            ra, dec, state
+        )
+        
+        if reset_rotation:
+            self.sky_canvas.reset_rotation_angle()
+        
+        self.sky_canvas.set_center(new_ra, new_dec)
         self._update_view()
+    
+    def _create_tracking_state(self) -> TrackingState:
+        """Create a TrackingState from current application state"""
+        lat, lon = self.control_panel.get_location()
+        lst = self._calculate_lst(self._sim_time, lon)
+        
+        return TrackingState(
+            center_ra=self.sky_canvas.center_ra,
+            center_dec=self.sky_canvas.center_dec,
+            rotation_angle=self.sky_canvas.get_rotation_angle(),
+            lst=lst,
+            observer_lat=lat,
+            observer_lon=lon
+        )
     
     def _on_optics_change(self, focal: float, sensor_w: float, sensor_h: float):
         """Handle optics parameter changes"""
@@ -311,6 +368,9 @@ class MainWindow:
         # Don't update control panel focal length - that's the camera setting
         # The scroll wheel just zooms the simulator view for navigation
         self._update_view()
+        
+        # Update drift display since it depends on focal length
+        self._update_drift_display()
         
         # Camera FOV stays the same - only simulator view changes
         self.control_panel.update_fov_info(self._camera_fov_width, self._camera_fov_height)
@@ -741,45 +801,62 @@ class MainWindow:
         if not self._rotation_enabled:
             return
         
-        # Update interval
+        # Update interval - fixed 50ms real time between ticks
         update_interval_ms = 50
         update_interval_sec = update_interval_ms / 1000.0
         
-        # Advance simulation time
-        sim_time_advance = timedelta(seconds=update_interval_sec * self._rotation_speed)
-        self._sim_time += sim_time_advance
+        # Calculate simulated time advance based on speed multiplier
+        sim_seconds = update_interval_sec * abs(self._rotation_speed)
+        sim_time_advance = timedelta(seconds=sim_seconds)
         
-        # Simulating an UNTRACKED camera (fixed to Earth, alt-az or stationary):
-        # - Earth rotates eastward (counter-clockwise when viewed from north pole)
-        # - Stars appear to drift WESTWARD across the sky
-        # - On screen: stars move from LEFT to RIGHT (when north is up)
-        # - To achieve this: we INCREASE the view center RA, which shifts
-        #   the view eastward, making stars appear to move right/westward
-        # 
-        # Rate: Earth rotates 360° in 23h 56m 4s (sidereal day)
-        # = 15.041 arcsec/sec of apparent star motion
+        if self._rotation_speed < 0:
+            self._sim_time -= sim_time_advance
+        else:
+            self._sim_time += sim_time_advance
         
-        ra_drift_per_sec = EARTH_ROTATION_RATE_ARCSEC_PER_SEC / 15.0 / 3600.0  # hours/sec
-        ra_drift = ra_drift_per_sec * update_interval_sec * self._rotation_speed
+        # Get tracking mode key from control panel and update manager
+        mode_key = self.control_panel.get_tracking_mode()
+        self._tracking_manager.set_mode(mode_key)
         
-        # Increase RA to make stars appear to move right (westward on screen)
-        new_ra = self.sky_canvas.center_ra + ra_drift
+        # Update camera angle from control panel
+        self._tracking_manager.camera_angle = self.control_panel.get_camera_angle()
         
-        # Wrap RA around 24 hours
-        if new_ra >= 24:
-            new_ra -= 24
-        elif new_ra < 0:
-            new_ra += 24
+        # Create current tracking state
+        lat, lon = self.control_panel.get_location()
+        lst = self._calculate_lst(self._sim_time, lon)
         
-        self.sky_canvas.center_ra = new_ra
+        state = TrackingState(
+            center_ra=self.sky_canvas.center_ra,
+            center_dec=self.sky_canvas.center_dec,
+            rotation_angle=self.sky_canvas.get_rotation_angle(),
+            lst=lst,
+            observer_lat=lat,
+            observer_lon=lon
+        )
         
-        # Update time display
+        # Calculate update using current tracking mode
+        update = self._tracking_manager.current_mode.calculate_update(
+            state, sim_seconds, self._rotation_speed
+        )
+        
+        # Apply rotation delta ONLY - do NOT change projection mode!
+        # The projection mode (RA-DEC vs Alt-Az) is a user setting, not tied to simulation
+        if update.reset_rotation:
+            self.sky_canvas.reset_rotation_angle()
+        elif abs(update.delta_rotation) > 0.0001:
+            self.sky_canvas.add_rotation_angle(update.delta_rotation)
+        
+        # Update center coordinates if mode changes them (e.g., RA drift)
+        if (abs(update.new_ra - state.center_ra) > 0.00001 or 
+            abs(update.new_dec - state.center_dec) > 0.00001):
+            self.sky_canvas.set_center(update.new_ra, update.new_dec)
+            self.control_panel.set_coords(update.new_ra, update.new_dec)
+        
+        # Update time display (this updates LST in the canvas)
         self._update_time_display()
         
+        # Update view to show star rotation
         self._update_view()
-        
-        # Update coordinate display
-        self.control_panel.set_coords(new_ra, self.sky_canvas.center_dec)
         
         # Schedule next tick
         self._rotation_timer_id = self.root.after(update_interval_ms, self._rotation_tick)
@@ -798,14 +875,666 @@ class MainWindow:
         self.sky_canvas.set_time_info(self._sim_time, lst, lat, lon)
     
     def _update_drift_display(self):
-        """Update the drift rate display based on current DEC and focal length"""
+        """Update the drift rate display based on current DEC and camera focal length"""
         # At the celestial equator, drift is 15.041 arcsec/sec
         # At other declinations, apparent drift = 15.041 * cos(dec) arcsec/sec
         dec_rad = math.radians(self.sky_canvas.center_dec)
         drift_arcsec = EARTH_ROTATION_RATE_ARCSEC_PER_SEC * math.cos(dec_rad) * self._rotation_speed
         
-        focal_length = self.sky_canvas.fov_calculator.focal_length
+        # Use camera focal length (equipment setting), NOT simulator view focal length
+        focal_length = self._camera_focal
         self.control_panel.update_drift_display(drift_arcsec, focal_length)
+    
+    def _show_setup_guide(self):
+        """Show the mount testing setup guide"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Mount Testing Setup Guide")
+        dialog.geometry("800x600")
+        dialog.transient(self.root)
+        
+        # Center on parent
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - 800) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - 600) // 2
+        dialog.geometry(f"+{x}+{y}")
+        
+        # Create scrollable text
+        frame = ttk.Frame(dialog)
+        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        scrollbar = ttk.Scrollbar(frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        text = tk.Text(frame, wrap=tk.WORD, yscrollcommand=scrollbar.set,
+                      font=('Courier', 10), bg='#f0f0f0')
+        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.config(command=text.yview)
+        
+        # Setup guide content
+        guide = """
+╔═══════════════════════════════════════════════════════════════════════════╗
+║            EQUATORIAL MOUNT TESTING SETUP GUIDE                           ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+
+This guide explains how to physically set up your equipment to test mount 
+GoTo accuracy and tracking using this simulator as a "virtual sky".
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ CONCEPT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The monitor displays a simulated sky. Your mount must be "polar aligned" to 
+the monitor (not to the real Polaris) so that:
+  • Mount's RA axis rotates parallel to monitor surface
+  • Mount's DEC axis moves perpendicular to monitor
+  • Camera points at monitor to see the simulated stars
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ PHYSICAL SETUP - SIDE VIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Option A: Tilted Monitor (Recommended)
+───────────────────────────────────────
+
+         North (up)
+            ↑
+            │    [Monitor]         Tilt monitor back by 
+            │      /│              latitude angle
+            │     / │              (e.g., 51.5° for London)
+            │    /  │
+            │   /   │
+            │  /    │
+    ────────┼─/─────┴──────── Horizontal
+            │/  
+            
+      [Camera on Mount]        Mount stays level
+         pointing up           Polar axis points at monitor
+                               perpendicular to its surface
+
+
+Option B: Tilted Mount (If monitor must stay vertical)
+───────────────────────────────────────────────────────
+
+            North
+              ↑
+              │
+         [Monitor]              Monitor vertical
+              │
+              │
+              │
+    ──────────┴────────────── Horizontal
+         
+          [Camera]             Mount base tilted up
+            ↗                  by latitude angle
+      [Mount Base]             Polar axis points
+        on wedge              perpendicular to monitor
+          /
+       ──/──
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ TOP VIEW - Mount Alignment
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+                    Monitor face
+                   (vertical plane)
+                         │
+                         │
+                    ┌────┴────┐
+                    │         │  ← Screen shows stars
+                    │ Monitor │
+                    │         │
+                    └────┬────┘
+                         │
+                         ↓ Polar axis
+                     direction
+                         
+                    [Camera]───→ pointing at monitor
+                         │
+                    [RA axis] ─ parallel to monitor surface
+                         │
+                    [Mount base]
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ EASIEST SETUP (Mount already polar aligned + vertical monitor)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+If your mount is already polar aligned AND you want to keep monitor vertical:
+
+1. Configure Simulator
+   ───────────────────
+   • Set LOCATION to match your mount (e.g., 51.5°N, 0°E)
+   • Set DATE/TIME to current date/time
+   • Set FOCAL LENGTH to your lens (e.g., 400mm)
+   • Set SENSOR SIZE (Full Frame: 36×24mm)
+   • Enable "Show Camera FOV Rectangle"
+
+2. Position Monitor + Mount
+   ────────────────────────
+   • Keep monitor VERTICAL (no tilt!)
+   • Place 2-3 meters from mount (for lens focus)
+   • Maximum brightness, darken room
+   • Point mount horizontally at monitor (Alt ≈ 0°, pointing due South)
+
+3. Navigate to Horizon View
+   ─────────────────────────
+   • In simulator, drag view to show sky at HORIZON
+   • Look for stars near Altitude = 0°, Azimuth = 180° (due South)
+   • This is what mount sees when pointing horizontally
+   • Center view on celestial equator (DEC ≈ 0°)
+
+4. Synchronize Mount
+   ─────────────────
+   • Note RA/DEC shown at simulator center
+   • Command mount to slew to those coordinates
+   • Camera should now see what simulator shows
+   • Enable "Simulate Rotation" at 1x speed
+
+5. Test GoTo and Tracking
+   ──────────────────────
+   • Use "Set Target" to mark any visible star
+   • Command mount to GoTo that target
+   • Star should center in camera view
+   • Track at various speeds to verify accuracy
+
+KEY INSIGHT: With vertical monitor, you're simulating looking at the horizon
+(not the pole). Mount stays level, points horizontally at monitor. Simulator
+shows horizon view instead of pole view.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ ALTERNATIVE: Tilted Monitor Setup (More Sky Coverage)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+If mount is polar aligned with phone app:
+
+1. Configure Simulator
+   ───────────────────
+   • Set LOCATION to match your mount (e.g., 51.5°N, 0°E)
+   • Set DATE/TIME to current date/time
+   • Set FOCAL LENGTH to your lens (e.g., 400mm)
+   • Set SENSOR SIZE (Full Frame: 36×24mm)
+   • Enable "Show Camera FOV Rectangle"
+
+2. Position Monitor
+   ────────────────
+   • Tilt monitor back by your LATITUDE angle (51.5° for London)
+   • Use phone inclinometer app for accuracy
+   • Place 2-3 meters from mount (for lens focus)
+   • Maximum brightness, darken room
+
+3. Point Camera at Monitor
+   ────────────────────────
+   • Your mount is ALREADY polar aligned (to real celestial pole)
+   • Point camera at monitor center
+   • Mount should point upward at angle ≈ latitude
+   • Monitor tilt matches what mount expects to see
+
+4. Synchronize Coordinates
+   ───────────────────────
+   • In simulator, navigate to show pole region (high DEC)
+   • Note current RA/DEC of monitor center
+   • Command mount to slew to those coordinates
+   • Camera should now see what simulator shows
+   • Enable "Simulate Rotation" at 1x speed
+
+5. Verify and Test
+   ────────────────
+   • Stars should rotate around pole as in real sky
+   • Test GoTo to various targets
+   • Track at various speeds
+
+ADVANTAGE: Tilted monitor lets you test full range of DEC angles, not just
+horizon. More realistic for actual observing sessions.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ DETAILED SETUP (If mount is NOT already polar aligned)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. SIMULATOR CONFIGURATION
+   ───────────────────────
+   • Set observer location to match your mount's location setting
+   • Example: 51.5°N, 0°E for Greenwich
+   • Set your camera's focal length (e.g., 400mm)
+   • Set sensor size (Full Frame: 36×24mm)
+   • Enable "Show Camera FOV Rectangle" in Mount Testing section
+
+2. MONITOR PLACEMENT
+   ──────────────────
+   • Position monitor 2-3 meters away (for 400mm lens to focus)
+   • Maximum brightness
+   • Darken room for better contrast
+   
+   Choose method (both equally accurate):
+   
+   A) Tilt monitor back by EXACT latitude angle (51.5° for London)
+      - Use digital angle finder or smartphone inclinometer app
+      - Measure angle from horizontal on monitor back/stand
+      - Secure monitor firmly so angle doesn't shift
+      - This simulates looking at celestial pole from your latitude
+   
+   B) Keep monitor vertical, tilt mount by EXACT latitude angle
+      - Place wedge under mount (must equal latitude angle precisely)
+      - Or use adjustable platform with angle measurement
+      - Mount polar axis will then point perpendicular to monitor
+
+3. MOUNT POSITIONING
+   ──────────────────
+   • Place mount on stable, level surface (check with spirit level)
+   • Point polar axis perpendicular to monitor face (see step 5)
+   • Polar axis should aim at monitor center
+   • Distance: far enough for lens minimum focus (typically 2-3m)
+   • Ensure mount base is rigid and won't shift during testing
+   • If using method B (vertical monitor), mount must be on wedge
+
+4. CAMERA MOUNTING
+   ────────────────
+   • Attach camera to mount
+   • Point camera at monitor
+   • Compose so yellow FOV rectangle fills about 40% of viewfinder
+   • Focus on monitor (manual focus, infinity won't work!)
+
+5. PRECISE POLAR ALIGNMENT (Critical Step!)
+   ──────────────────────────────────────────
+   
+   The monitor represents the celestial sphere. Your mount's polar axis
+   must point EXACTLY perpendicular to the monitor surface.
+   
+   TOOLS NEEDED:
+   • Carpenter's square or large set square
+   • Spirit level
+   • Measuring tape or ruler
+   • Laser pointer (optional but very helpful)
+   • Smartphone inclinometer app (optional)
+   
+   METHOD 1: Laser Alignment (Most Accurate)
+   ─────────────────────────────────────────
+   a) Attach small laser pointer to mount's polar axis
+      (tape or rubber bands work)
+   b) Turn on laser, point at monitor
+   c) Laser dot should hit monitor at right angle (perpendicular)
+   d) Slowly rotate RA axis through full range
+   e) Laser should trace a HORIZONTAL line on monitor
+   f) If line is diagonal or vertical:
+      - Adjust mount's orientation/tilt
+      - Repeat until line is perfectly horizontal
+   g) Adjust mount distance so laser hits monitor center
+   
+   METHOD 2: Square Alignment (Good Accuracy)
+   ──────────────────────────────────────────
+   a) Place carpenter's square against monitor surface
+   b) One edge flat on monitor, other edge points toward mount
+   c) Sight along square's edge - should point at polar axis
+   d) Check from multiple points on monitor (top, middle, bottom)
+   e) All lines should converge at polar axis
+   f) Adjust mount position until all checks align
+   
+   METHOD 3: Distance Measurement (Moderate Accuracy)
+   ──────────────────────────────────────────────────
+   a) Measure distance from polar axis to TOP of monitor = D1
+   b) Measure distance from polar axis to BOTTOM of monitor = D2
+   c) If D1 = D2 (within 1cm), axis aims at center
+   d) Rotate mount 90° and repeat with LEFT/RIGHT edges
+   e) Adjust until all four measurements equal
+   
+   VERIFICATION:
+   • Unlock both mount axes
+   • Manually sweep RA through full range
+   • Camera view should move HORIZONTALLY across monitor only
+   • Now sweep DEC through full range  
+   • Camera view should move VERTICALLY on monitor only
+   • Any diagonal motion = not perpendicular, adjust and recheck
+   
+   ACCURACY GOAL:
+   • < 0.5° error = < 1cm positional offset per meter distance
+   • Use protractor or inclinometer to verify axis angle if needed
+   • For 51.5° latitude: polar axis should be 38.5° from horizontal
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ TESTING PROCEDURES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TEST 1: Polar Alignment Quality Check
+──────────────────────────────────────
+1. In simulator, enable "Simulate Rotation" at 100x speed
+2. Enable "Show Crosshair" for reference
+3. Center Polaris (or any bright star near pole) in camera view
+4. Lock DEC axis (RA tracking disabled)
+5. Watch for 60 seconds real time (= 100 minutes simulated)
+6. Measure drift direction and amount:
+   • Horizontal drift only = PERFECT alignment
+   • Vertical drift < 5 pixels = excellent (< 0.1° error)
+   • Vertical drift 5-20 pixels = acceptable (0.1-0.5° error)
+   • Vertical drift > 20 pixels = poor, recheck perpendicularity
+7. Repeat test with stars in EAST and WEST parts of sky
+8. All stars should drift horizontally only if aligned correctly
+9. With perfect alignment, periodic error should be < 10 arcsec
+
+TEST 2: GoTo Accuracy
+─────────────────────
+1. In simulator "Mount Testing", enter target RA/DEC
+2. Click "Set Target" (green marker appears)
+3. Command mount to GoTo same coordinates
+4. Check camera view - marker should be centered
+5. "Offset" display shows your GoTo error
+6. Repeat with different targets across the sky
+
+TEST 3: Tracking Accuracy
+─────────────────────────
+1. Center a bright star in camera
+2. Enable rotation at 10x or 30x speed
+3. Watch star over 1-2 minutes
+4. Star should stay centered
+5. Drift indicates tracking error or polar misalignment
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ TIPS & TROUBLESHOOTING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PROBLEM: Can't focus on monitor
+  → Solution: Increase distance or use shorter focal length (200mm)
+
+PROBLEM: Stars too dim in camera
+  → Solution: Increase monitor brightness
+  → Solution: Use simulator's "Star Brightness" control (up to 3x)
+  → Solution: Increase camera ISO or exposure time
+
+PROBLEM: FOV rectangle too small/large
+  → Solution: Verify focal length matches your lens
+  → Solution: Verify sensor size matches your camera
+  → Solution: Use scroll wheel to zoom simulator view
+
+PROBLEM: Mount's RA motion moves camera vertically
+  → Solution: Polar axis not perpendicular to monitor
+  → Solution: Use laser or square to verify 90° alignment
+
+PROBLEM: Objects appear in wrong orientation
+  → Solution: Check latitude setting in simulator matches mount setting
+  → Solution: Verify monitor tilt angle exactly matches latitude
+
+PROBLEM: Tracking drift not consistent across sky
+  → Solution: Polar axis not pointing at monitor center - adjust mount position
+  → Solution: Monitor not truly flat - check for warping or curve
+
+PROBLEM: Can't get polar axis exactly perpendicular
+  → Solution: Use smartphone inclinometer app on polar axis
+  → Solution: Mount axis should read (90° - latitude) from horizontal
+  → Solution: For 51.5° latitude: polar axis should be 38.5° from horizontal
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SIMPLIFIED TESTING (WITHOUT POLAR ALIGNMENT)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+If polar alignment is too complex, test GoTo accuracy only:
+
+1. Keep monitor vertical (no tilt)
+2. Mount camera on simple pan/tilt head (not equatorial mount)
+3. Use simulator in Alt-Az mode (already enabled)
+4. Click "Use Center" to mark current camera position
+5. Manually slew camera to new position
+6. Check if crosshair still centered
+7. Measures pointing accuracy without tracking
+
+This won't test tracking, but verifies basic positioning accuracy.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ EQUIPMENT RECOMMENDATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+REQUIRED:
+  • Large monitor (27" or larger recommended)
+  • Camera with lens (200-600mm range ideal)
+  • Equatorial mount with GoTo
+  • 2-3 meters clear space
+
+HELPFUL:
+  • Angle finder or protractor (for monitor tilt)
+  • Wedge or adjustable platform (for mount tilt)
+  • Dark room or blackout curtains
+  • Remote shutter or intervalometer (for long exposures)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For questions or issues, refer to the README.md file or project documentation.
+
+"""
+        
+        text.insert('1.0', guide)
+        text.config(state=tk.DISABLED)
+        
+        # Close button
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(side=tk.BOTTOM, pady=10)
+        ttk.Button(btn_frame, text="Close", command=dialog.destroy, width=15).pack()
+    
+    def _show_about(self):
+        """Show about dialog"""
+        about_text = """Night Sky Simulator v1.0
+
+A Python-based astronomical simulator for:
+• Visual sky simulation with real catalog data
+• Equatorial mount GoTo testing
+• Astrophotography planning
+• Educational visualization
+
+Features:
+• Alt-Az coordinate mode
+• Earth rotation simulation
+• Mount testing tools
+• Real NGC2000 & BSC5 catalogs
+
+Built with Python + tkinter
+© 2025"""
+        
+        messagebox.showinfo("About Night Sky Simulator", about_text)
+    
+    def _export_settings(self):
+        """Export all settings to JSON file"""
+        try:
+            # Get location from control panel
+            lat, lon = self.control_panel.get_location()
+            
+            # Collect all settings - comprehensive dump
+            settings = {
+                'version': '1.0',
+                'view': {
+                    'center_ra': self.sky_canvas.center_ra,
+                    'center_dec': self.sky_canvas.center_dec,
+                    'focal_length': self.sky_canvas.fov_calculator.focal_length,
+                    'rotation_angle': self.sky_canvas.get_rotation_angle(),
+                },
+                'optics': self.control_panel.get_optics(),
+                'display': self.control_panel.get_display_options(),
+                'location': {
+                    'latitude': lat,
+                    'longitude': lon,
+                },
+                'rotation': {
+                    'enabled': self.control_panel.get_rotation_enabled(),
+                    'speed': self.control_panel.get_rotation_speed(),
+                    'tracking_mode': self.control_panel.get_tracking_mode(),
+                },
+                'testing': self.control_panel.get_testing_options(),
+                'simulation_time': self._sim_time.isoformat(),
+                'canvas': {
+                    'altaz_mode': self.sky_canvas._altaz_mode,
+                    'show_grid': self.sky_canvas.show_grid,
+                    'show_labels': self.sky_canvas.show_labels,
+                    'mag_limit': self.sky_canvas.mag_limit,
+                    'show_diffraction_spikes': self.sky_canvas.show_diffraction_spikes,
+                    'diffraction_spike_count': self.sky_canvas.diffraction_spike_count,
+                    'diffraction_spike_rotation': self.sky_canvas.diffraction_spike_rotation,
+                },
+                'camera_fov': {
+                    'width': self._camera_fov_width,
+                    'height': self._camera_fov_height,
+                    'focal': self._camera_focal,
+                },
+                'selected_object': {
+                    'name': self.selected_object.name if self.selected_object else None,
+                    'id': self.selected_object.id if self.selected_object else None,
+                    'ra': self.selected_object.ra_hours if self.selected_object else None,
+                    'dec': self.selected_object.dec_degrees if self.selected_object else None,
+                },
+                'target': self.control_panel.get_target(),
+            }
+            
+            # Use /app/settings if available (mounted in dev), otherwise /tmp
+            if os.path.exists("/app/settings") and os.access("/app/settings", os.W_OK):
+                default_dir = "/app/settings"
+            else:
+                default_dir = "/tmp"
+            
+            # Ask for save location
+            filename = filedialog.asksaveasfilename(
+                title="Export Settings",
+                defaultextension=".json",
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+                initialfile="sky_simulator_settings.json",
+                initialdir=default_dir
+            )
+            
+            if filename:
+                with open(filename, 'w') as f:
+                    json.dump(settings, f, indent=2)
+                messagebox.showinfo("Export Successful", 
+                                   f"Settings exported to:\n{filename}")
+        except Exception as e:
+            messagebox.showerror("Export Error", 
+                               f"Failed to export settings:\n{str(e)}")
+    
+    def _import_settings(self):
+        """Import settings from JSON file"""
+        try:
+            # Use /app/settings if available (mounted in dev), otherwise /tmp
+            if os.path.exists("/app/settings") and os.access("/app/settings", os.R_OK):
+                default_dir = "/app/settings"
+            else:
+                default_dir = "/app"
+            
+            # Ask for file to load
+            filename = filedialog.askopenfilename(
+                title="Import Settings",
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+                initialdir=default_dir
+            )
+            
+            if not filename:
+                return
+            
+            with open(filename, 'r') as f:
+                settings = json.load(f)
+            
+            # Apply settings
+            if 'view' in settings:
+                view = settings['view']
+                if 'center_ra' in view and 'center_dec' in view:
+                    self._goto_coords(view['center_ra'], view['center_dec'])
+                if 'focal_length' in view:
+                    self.sky_canvas.fov_calculator.focal_length = view['focal_length']
+            
+            if 'optics' in settings:
+                optics = settings['optics']
+                self.control_panel.set_optics(
+                    optics.get('focal_length', 200),
+                    optics.get('sensor_width', 36),
+                    optics.get('sensor_height', 24)
+                )
+                self._on_optics_change(
+                    optics.get('focal_length', 200),
+                    optics.get('sensor_width', 36),
+                    optics.get('sensor_height', 24)
+                )
+            
+            if 'display' in settings:
+                self.control_panel.set_display_options(settings['display'])
+            
+            if 'location' in settings:
+                loc = settings['location']
+                self.control_panel.set_location(
+                    loc.get('latitude', 51.5),
+                    loc.get('longitude', 0.0)
+                )
+                self._on_location_change(
+                    loc.get('latitude', 51.5),
+                    loc.get('longitude', 0.0)
+                )
+            
+            if 'rotation' in settings:
+                rot = settings['rotation']
+                if 'tracking_mode' in rot:
+                    self.control_panel.set_tracking_mode(rot['tracking_mode'])
+                if 'speed' in rot:
+                    self.control_panel.set_rotation_speed(rot['speed'])
+                if 'enabled' in rot and rot['enabled']:
+                    self.control_panel.set_rotation_enabled(True)
+                    self._on_rotation_toggle(True)
+            
+            if 'testing' in settings:
+                self.control_panel.set_testing_options(settings['testing'])
+                self._on_testing_change()
+            
+            if 'simulation_time' in settings:
+                self._sim_time = datetime.fromisoformat(settings['simulation_time'])
+                self._update_time_display()
+            
+            # Apply canvas settings
+            if 'canvas' in settings:
+                canvas = settings['canvas']
+                if 'altaz_mode' in canvas:
+                    self.sky_canvas.set_altaz_mode(canvas['altaz_mode'])
+                if 'show_grid' in canvas:
+                    self.sky_canvas.show_grid = canvas['show_grid']
+                if 'show_labels' in canvas:
+                    self.sky_canvas.show_labels = canvas['show_labels']
+                if 'mag_limit' in canvas:
+                    self.sky_canvas.mag_limit = canvas['mag_limit']
+                if 'show_diffraction_spikes' in canvas:
+                    self.sky_canvas.show_diffraction_spikes = canvas['show_diffraction_spikes']
+                if 'diffraction_spike_count' in canvas:
+                    self.sky_canvas.diffraction_spike_count = canvas['diffraction_spike_count']
+                if 'diffraction_spike_rotation' in canvas:
+                    self.sky_canvas.diffraction_spike_rotation = canvas['diffraction_spike_rotation']
+            
+            # Apply rotation angle
+            if 'view' in settings and 'rotation_angle' in settings['view']:
+                self.sky_canvas._rotation_angle = settings['view']['rotation_angle']
+            
+            # Apply camera FOV
+            if 'camera_fov' in settings:
+                fov = settings['camera_fov']
+                if 'width' in fov:
+                    self._camera_fov_width = fov['width']
+                if 'height' in fov:
+                    self._camera_fov_height = fov['height']
+                if 'focal' in fov:
+                    self._camera_focal = fov['focal']
+            
+            # Restore target/selected object
+            if 'target' in settings and settings['target']:
+                # Try to navigate to the saved target
+                self._goto_target(settings['target'])
+            elif 'selected_object' in settings and settings['selected_object']:
+                # If no target name, but we have coordinates, go there
+                obj = settings['selected_object']
+                if obj.get('ra') is not None and obj.get('dec') is not None:
+                    self._goto_coords(obj['ra'], obj['dec'])
+            
+            self._update_view()
+            
+            messagebox.showinfo("Import Successful", 
+                               "Settings imported successfully!")
+        except Exception as e:
+            messagebox.showerror("Import Error", 
+                               f"Failed to import settings:\n{str(e)}")
     
     def run(self):
         """Start the application main loop"""
