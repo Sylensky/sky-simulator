@@ -352,6 +352,29 @@ class ControlPanel:
         camera_angle_spin.pack(side=tk.LEFT, padx=2)
         ttk.Label(camera_angle_frame, text="° from pole").pack(side=tk.LEFT, padx=2)
         
+        # Monitor size configuration
+        monitor_frame = ttk.Frame(test_frame)
+        monitor_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(monitor_frame, text="Monitor Size:").pack(side=tk.LEFT)
+        self.monitor_size_var = tk.StringVar(value="27\"")
+        monitor_combo = ttk.Combobox(monitor_frame, textvariable=self.monitor_size_var,
+                                    values=["24\"", "27\"", "32\"", "34\"", "43\""],
+                                    width=8, state="readonly")
+        monitor_combo.pack(side=tk.LEFT, padx=2)
+        monitor_combo.bind('<<ComboboxSelected>>', lambda e: self._on_monitor_size_change())
+        
+        # Viewing distance input
+        distance_frame = ttk.Frame(test_frame)
+        distance_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(distance_frame, text="View Distance:").pack(side=tk.LEFT)
+        self.viewing_distance_var = tk.DoubleVar(value=270.0)
+        distance_spin = ttk.Spinbox(distance_frame, from_=30, to=500, increment=10,
+                                   textvariable=self.viewing_distance_var, width=8)
+        distance_spin.pack(side=tk.LEFT, padx=2)
+        ttk.Label(distance_frame, text="cm").pack(side=tk.LEFT, padx=2)
+        distance_spin.bind('<Return>', lambda e: self._on_viewing_distance_change())
+        distance_spin.bind('<FocusOut>', lambda e: self._on_viewing_distance_change())
+        
         # Quick navigation
         nav_btns = ttk.Frame(test_frame)
         nav_btns.pack(fill=tk.X, padx=5, pady=2)
@@ -737,6 +760,31 @@ class ControlPanel:
             return float(self.camera_angle_var.get())
         except (ValueError, AttributeError):
             return 63.0  # Default camera angle
+    
+    def get_monitor_config(self) -> tuple:
+        """Get monitor size and viewing distance. Returns (size_inches, distance_cm)"""
+        try:
+            size_str = self.monitor_size_var.get().replace('"', '')
+            size = float(size_str)
+            distance = float(self.viewing_distance_var.get())
+            return size, distance
+        except (ValueError, AttributeError):
+            return 27.0, 60.0  # Default: 27" at 60cm
+    
+    def get_fov_multiplier(self) -> float:
+        """
+        For realistic projection matching a telescope/camera view:
+        The simulator should show EXACTLY what the camera sees (1:1 mapping).
+        
+        With 300mm lens (6.9° FOV), the simulator shows 6.9°.
+        Stars appear at correct angular spacing as through the actual lens.
+        
+        Returns: Always 1.0 for true-to-life representation.
+        The monitor/viewing distance settings are for future use but don't affect FOV.
+        """
+        # For realistic telescope simulation: show exactly what the camera sees
+        # No magnification, no reduction - pure 1:1 mapping
+        return 1.0
 
     # Testing section handlers
     def _on_set_target(self):
@@ -805,6 +853,22 @@ class ControlPanel:
         """Handle testing settings change"""
         if self.on_testing_change:
             self.on_testing_change()
+    
+    def _on_monitor_size_change(self):
+        """Handle monitor size change"""
+        # Trigger optics change to recalculate FOV with new multiplier
+        if self.on_optics_change:
+            optics = self.get_optics()
+            if optics:
+                self.on_optics_change(optics['focal_length'], optics['sensor_width'], optics['sensor_height'])
+    
+    def _on_viewing_distance_change(self):
+        """Handle viewing distance change"""
+        # Trigger optics change to recalculate FOV with new multiplier
+        if self.on_optics_change:
+            optics = self.get_optics()
+            if optics:
+                self.on_optics_change(optics['focal_length'], optics['sensor_width'], optics['sensor_height'])
     
     def get_testing_options(self) -> dict:
         """Get all testing options - FOV uses current optics settings"""

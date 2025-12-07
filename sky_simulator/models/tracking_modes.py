@@ -24,6 +24,7 @@ class TrackingState:
     lst: float  # Local Sidereal Time in hours
     observer_lat: float  # degrees
     observer_lon: float  # degrees
+    camera_angle: float = 63.0  # degrees from polar axis (0° = looking at pole, 90° = equator)
 
 
 @dataclass
@@ -143,8 +144,15 @@ class FieldRotationMode(TrackingMode):
         sim_seconds: float,
         speed_multiplier: float
     ) -> TrackingUpdate:
-        # Field rotates at sidereal rate around celestial pole
-        delta_angle = self.SIDEREAL_RATE_DEG_PER_SEC * sim_seconds
+        # Field rotation rate depends on camera angle from polar axis
+        # At pole (0°): no rotation (sin(0) = 0)
+        # At equator (90°): full sidereal rate (sin(90) = 1)
+        # At camera_angle: rotation_rate = sidereal_rate × sin(camera_angle)
+        camera_angle_rad = math.radians(state.camera_angle)
+        rotation_factor = math.sin(camera_angle_rad)
+        
+        # Calculate rotation for this tick
+        delta_angle = self.SIDEREAL_RATE_DEG_PER_SEC * sim_seconds * rotation_factor
         if speed_multiplier < 0:
             delta_angle = -delta_angle
         

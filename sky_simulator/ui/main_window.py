@@ -328,7 +328,8 @@ class MainWindow:
             rotation_angle=self.sky_canvas.get_rotation_angle(),
             lst=lst,
             observer_lat=lat,
-            observer_lon=lon
+            observer_lon=lon,
+            camera_angle=self._tracking_manager.camera_angle
         )
     
     def _on_optics_change(self, focal: float, sensor_w: float, sensor_h: float):
@@ -831,7 +832,8 @@ class MainWindow:
             rotation_angle=self.sky_canvas.get_rotation_angle(),
             lst=lst,
             observer_lat=lat,
-            observer_lon=lon
+            observer_lon=lon,
+            camera_angle=self._tracking_manager.camera_angle
         )
         
         # Calculate update using current tracking mode

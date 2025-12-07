@@ -255,6 +255,50 @@ class SkyCanvas:
         ra_rad = math.radians(ra_hours * 15.0)
         dec_rad = math.radians(dec_deg)
         
+        # Apply field rotation in RA/DEC space BEFORE projection
+        # Rotate star positions around Polaris in celestial coordinates
+        if abs(self._rotation_angle) > 0.001 and not self._altaz_mode:
+            # Polaris coordinates: RA = 2.5297h, DEC = 89.264°
+            polaris_ra_rad = math.radians(2.5297 * 15.0)
+            polaris_dec_rad = math.radians(89.264)
+            
+            # Rotation angle (negative because we rotate sky, not observer)
+            theta = math.radians(-self._rotation_angle)
+            
+            # Rotate the star's position around Polaris using spherical rotation
+            # Convert to cartesian coordinates centered on Polaris
+            # Step 1: Convert RA/DEC to unit vector
+            x = math.cos(dec_rad) * math.cos(ra_rad)
+            y = math.cos(dec_rad) * math.sin(ra_rad)
+            z = math.sin(dec_rad)
+            
+            # Step 2: Rotation axis is the vector pointing to Polaris
+            axis_x = math.cos(polaris_dec_rad) * math.cos(polaris_ra_rad)
+            axis_y = math.cos(polaris_dec_rad) * math.sin(polaris_ra_rad)
+            axis_z = math.sin(polaris_dec_rad)
+            
+            # Step 3: Rodrigues' rotation formula
+            # v_rot = v*cos(θ) + (k×v)*sin(θ) + k*(k·v)*(1-cos(θ))
+            cos_theta = math.cos(theta)
+            sin_theta = math.sin(theta)
+            
+            # k·v (dot product)
+            dot = axis_x * x + axis_y * y + axis_z * z
+            
+            # k×v (cross product)
+            cross_x = axis_y * z - axis_z * y
+            cross_y = axis_z * x - axis_x * z
+            cross_z = axis_x * y - axis_y * x
+            
+            # Apply rotation
+            x_rot = x * cos_theta + cross_x * sin_theta + axis_x * dot * (1 - cos_theta)
+            y_rot = y * cos_theta + cross_y * sin_theta + axis_y * dot * (1 - cos_theta)
+            z_rot = z * cos_theta + cross_z * sin_theta + axis_z * dot * (1 - cos_theta)
+            
+            # Step 4: Convert back to RA/DEC
+            ra_rad = math.atan2(y_rot, x_rot)
+            dec_rad = math.asin(max(-1.0, min(1.0, z_rot)))
+        
         if self._altaz_mode:
             # Transform to Alt-Az coordinates for realistic view
             lat_rad = math.radians(self._observer_lat)
@@ -348,45 +392,6 @@ class SkyCanvas:
                 x_proj = k * math.cos(dec_rad) * math.sin(ra_rad - center_ra_rad)
                 y_proj = k * (math.cos(center_dec_rad) * math.sin(dec_rad) - 
                              math.sin(center_dec_rad) * math.cos(dec_rad) * math.cos(ra_rad - center_ra_rad))
-            
-            # Apply field rotation around celestial pole if rotation angle is set
-            # The rotation happens around where the North Celestial Pole (DEC +90°) 
-            # would project to on the screen
-            if abs(self._rotation_angle) > 0.001:
-                # Calculate pole position in projection coordinates
-                # At DEC = 90°, sin(dec) = 1, cos(dec) = 0
-                # The pole projects to (x=0, y=k*(cos(center_dec)*1 - sin(center_dec)*0))
-                #                     = (0, k*cos(center_dec))
-                # where k depends on angular distance from view center to pole
-                
-                # Angular distance from view center to pole
-                # cos(c) = sin(center_dec) * sin(90°) + cos(center_dec) * cos(90°) * cos(dRA)
-                #        = sin(center_dec) * 1 + cos(center_dec) * 0
-                #        = sin(center_dec)
-                cos_c_pole = math.sin(center_dec_rad)
-                
-                # Calculate pole projection position
-                if cos_c_pole > -0.99:  # Pole not directly behind us
-                    k_pole = 1.0 / (1.0 + cos_c_pole) if cos_c_pole > -0.99 else 10.0
-                    pole_x = 0  # Pole is on the DEC axis (no RA offset at pole)
-                    pole_y = k_pole * math.cos(center_dec_rad)  # Above center if looking north of equator
-                    
-                    # Rotate projection coordinates around pole position
-                    theta = math.radians(self._rotation_angle)
-                    cos_theta = math.cos(theta)
-                    sin_theta = math.sin(theta)
-                    
-                    # Translate to pole-centered coordinates
-                    dx = x_proj - pole_x
-                    dy = y_proj - pole_y
-                    
-                    # Rotate
-                    x_rot = dx * cos_theta - dy * sin_theta
-                    y_rot = dx * sin_theta + dy * cos_theta
-                    
-                    # Translate back
-                    x_proj = x_rot + pole_x
-                    y_proj = y_rot + pole_y
         
         # Apply field rotation (parallactic angle) if enabled
         # Note: sky rotation is now applied in RA/DEC space above, not here
