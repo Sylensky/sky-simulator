@@ -83,6 +83,7 @@ services:
       # Mount source for development (no rebuild needed)
       - ./sky_simulator:/app/sky_simulator:ro
       - ./data:/app/data:ro
+      - ./settings:/app/settings:rw
       - ./run_sky_simulator.py:/app/run_sky_simulator.py:ro
     
     network_mode: host
