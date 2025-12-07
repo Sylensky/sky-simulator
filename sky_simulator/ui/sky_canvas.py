@@ -556,6 +556,9 @@ class SkyCanvas:
         if self._show_cursor_coords and self._cursor_ra is not None:
             self._draw_cursor_coords()
         
+        # Draw FOV info overlay (top-left)
+        self._draw_fov_info_overlay()
+        
         # Draw object info overlay (bottom-right)
         self._draw_object_info_overlay()
     
@@ -929,6 +932,46 @@ class SkyCanvas:
         self.canvas.create_text(x, y + size + 15, text=dist_str,
                                fill=color, font=('Arial', 9),
                                anchor=tk.N, tags="target_marker")
+    
+    def _draw_fov_info_overlay(self):
+        """Draw FOV information in top-left corner showing effective focal length"""
+        import math
+        
+        # Get current FOV
+        current_fov_width = self.fov_width
+        current_fov_height = self.fov_height
+        
+        # Get sensor dimensions from FOV calculator
+        sensor_width_mm = self.fov_calculator.sensor_width
+        sensor_height_mm = self.fov_calculator.sensor_height
+        
+        # Calculate effective focal length that produces this FOV
+        # FOV = 2 × arctan(sensor / (2 × focal))
+        # focal = sensor / (2 × tan(FOV/2))
+        effective_focal_width = sensor_width_mm / (2 * math.tan(math.radians(current_fov_width / 2)))
+        effective_focal_height = sensor_height_mm / (2 * math.tan(math.radians(current_fov_height / 2)))
+        effective_focal = (effective_focal_width + effective_focal_height) / 2
+        
+        # Format text
+        info_lines = [
+            f"FOV: {current_fov_width:.2f}° × {current_fov_height:.2f}°",
+            f"Effective: {effective_focal:.0f}mm",
+            f"Sensor: {sensor_width_mm:.0f}×{sensor_height_mm:.0f}mm"
+        ]
+        info_text = "\n".join(info_lines)
+        
+        # Draw background box
+        padding = 10
+        box_width = 180
+        box_height = 55
+        self.canvas.create_rectangle(padding - 5, padding - 5, 
+                                     padding + box_width, padding + box_height,
+                                     fill='#0a0a20', outline='#444466', tags="fov_info")
+        
+        # Draw text
+        self.canvas.create_text(padding, padding,
+                               text=info_text, fill='#aaffaa',
+                               font=('Consolas', 10), anchor=tk.NW, tags="fov_info")
     
     def _draw_cursor_coords(self):
         """Draw coordinate readout at cursor position"""

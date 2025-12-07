@@ -115,8 +115,12 @@ class MainWindow:
             self._camera_fov_height = 2 * math.degrees(math.atan(sensor_h / (2 * focal)))
             self._camera_focal = focal
             
-            # Set simulator to show 2.5x wider view
-            simulator_focal = focal / 2.5
+            # Get FOV multiplier based on monitor config and viewing distance
+            fov_multiplier = self.control_panel.get_fov_multiplier()
+            
+            # Set simulator to show wider view based on multiplier
+            # This makes the screen feel like a realistic "window" into the sky
+            simulator_focal = focal / fov_multiplier
             self.sky_canvas.fov_calculator.focal_length = simulator_focal
             
             # Update FOV info display
